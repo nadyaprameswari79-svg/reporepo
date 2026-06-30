@@ -17,7 +17,7 @@ GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
 genai.configure(api_key=GEMINI_API_KEY)
-gemini = genai.GenerativeModel("gemini-2.0-flash")
+gemini = genai.GenerativeModel("gemini-2.5-flash")
 
 # Simpan sesi chat per user (biar Gemini ingat konteks)
 sessions: dict[int, genai.ChatSession] = {}
