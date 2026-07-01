@@ -106,7 +106,7 @@ def _build_laporan(ws, ss):
         ["Total Pemasukan",   '=SUMIF(Transaksi!D:D,"MASUK",Transaksi!E:E)'],
         ["Total Pengeluaran", '=SUMIF(Transaksi!D:D,"KELUAR",Transaksi!E:E)'],
         ["Saldo Bersih",      "=B4-B5"],
-    ])
+    ], value_input_option="USER_ENTERED")
     ws.format("A4:A6", {"textFormat": {"bold": True}})
     ws.format("B4", {"backgroundColor": {"red": 0.85, "green": 0.93, "blue": 0.83}})
     ws.format("B5", {"backgroundColor": {"red": 0.99, "green": 0.91, "blue": 0.91}})
@@ -124,7 +124,7 @@ def _build_laporan(ws, ss):
     kat_keluar = ["Makan", "Transport", "Belanja", "Tagihan", "Hiburan", "Kesehatan", "Lainnya"]
     for i, k in enumerate(kat_keluar):
         r = 9 + i
-        ws.update(f"A{r}:B{r}", [[k, f'=SUMIFS(Transaksi!E:E,Transaksi!D:D,"KELUAR",Transaksi!F:F,"{k}")']])
+        ws.update(f"A{r}:B{r}", [[k, f'=SUMIFS(Transaksi!E:E,Transaksi!D:D,"KELUAR",Transaksi!F:F,"{k}")']], value_input_option="USER_ENTERED")
         ws.format(f"B{r}", {"numberFormat": {"type": "NUMBER", "pattern": '"Rp "#,##0'}})
         if i % 2 == 0:
             ws.format(f"A{r}:B{r}", {"backgroundColor": {"red": 0.99, "green": 0.95, "blue": 0.95}})
@@ -138,7 +138,7 @@ def _build_laporan(ws, ss):
     kat_masuk = ["Gaji", "Jualan", "Freelance", "Investasi", "Bonus", "Lainnya"]
     for i, k in enumerate(kat_masuk):
         r = sr + 1 + i
-        ws.update(f"A{r}:B{r}", [[k, f'=SUMIFS(Transaksi!E:E,Transaksi!D:D,"MASUK",Transaksi!F:F,"{k}")']])
+        ws.update(f"A{r}:B{r}", [[k, f'=SUMIFS(Transaksi!E:E,Transaksi!D:D,"MASUK",Transaksi!F:F,"{k}")']], value_input_option="USER_ENTERED")
         ws.format(f"B{r}", {"numberFormat": {"type": "NUMBER", "pattern": '"Rp "#,##0'}})
         if i % 2 == 0:
             ws.format(f"A{r}:B{r}", {"backgroundColor": {"red": 0.90, "green": 0.98, "blue": 0.90}})
