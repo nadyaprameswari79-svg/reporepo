@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 import logging
 import urllib.parse
 from datetime import datetime
@@ -8,7 +9,7 @@ import httpx
 import gspread
 from google.oauth2.service_account import Credentials
 import google.generativeai as genai
-from telegram import Update
+from telegram import Update, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 logging.basicConfig(
@@ -215,32 +216,41 @@ async def get_saldo_text() -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Halo! Bot AI + Pencatat Keuangan.\n\n"
-        "Catat transaksi cukup chat biasa:\n"
+        "Halo! Bot AI Pribadi.\n\n"
+        "KEUANGAN — cukup chat biasa:\n"
         "  beli makan 25rb\n"
         "  masuk gaji 3 juta\n"
         "  bayar listrik 150000\n\n"
-        "Perintah:\n"
+        "PERINTAH AI:\n"
+        "/image <prompt>  — Generate gambar\n"
+        "/editimage       — Edit foto (kirim foto + caption)\n"
+        "/story <tema>    — Buat script + gambar per scene\n"
+        "/ugc <produk>    — Generate foto UGC style\n\n"
+        "KEUANGAN:\n"
         "/saldo  — Cek saldo\n"
         "/setup  — Setup Google Sheets\n"
-        "/image  — Generate gambar\n"
         "/clear  — Reset chat AI\n"
-        "/help   — Bantuan"
+        "/help   — Bantuan lengkap"
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "CATAT TRANSAKSI (chat biasa):\n"
+        "AI IMAGE:\n"
+        "/image kucing astronot       — Text to image\n"
+        "/editimage                   — Lihat cara edit foto\n"
+        "  → Kirim foto + caption instruksi edit\n"
+        "  → Contoh: foto selfie + caption 'ganti background pantai'\n"
+        "/story promosi kopi kekinian — Script + gambar 2 scene\n"
+        "/ugc skincare vitamin C      — Foto UGC style otomatis\n\n"
+        "KEUANGAN (chat biasa):\n"
         "  beli makan siang 25rb\n"
         "  masuk gaji 3 juta\n"
-        "  bensin 50ribu\n"
-        "  terima bayaran freelance 500rb\n\n"
-        "PERINTAH:\n"
-        "/saldo         — Cek total saldo\n"
-        "/setup         — Setup ulang Google Sheets\n"
-        "/image <prompt>— Generate gambar\n"
-        "/clear         — Reset percakapan AI"
+        "  bayar listrik 150000\n\n"
+        "PERINTAH KEUANGAN:\n"
+        "/saldo  — Cek total saldo\n"
+        "/setup  — Setup ulang Google Sheets\n"
+        "/clear  — Reset percakapan AI"
     )
 
 
@@ -340,14 +350,204 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Terjadi kesalahan. Coba lagi.")
 
 
+async def editimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    await update.message.reply_text(
+        "Cara pakai Edit Image:\n\n"
+        "1. Kirim foto ke bot ini\n"
+        "2. Isi caption dengan instruksi editnya\n\n"
+        "Contoh:\n"
+        "  Foto selfie + caption: ganti background jadi pantai sunset\n"
+        "  Foto produk + caption: buat jadi foto studio profesional\n"
+        "  Foto + caption: ubah jadi gaya anime\n\n"
+        "Kirim foto TANPA caption → bot mendeskripsikan gambarnya."
+    )
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+
+    photo   = update.message.photo[-1]
+    caption = (update.message.caption or "").strip()
+    msg     = await update.message.reply_text("Memproses foto...")
+
+    try:
+        file        = await photo.get_file()
+        image_bytes = bytes(await file.download_as_bytearray())
+        image_part  = {"mime_type": "image/jpeg", "data": image_bytes}
+
+        if not caption:
+            response = gemini.generate_content([
+                "Deskripsikan gambar ini dengan detail dalam bahasa Indonesia.",
+                image_part,
+            ])
+            await msg.edit_text(response.text[:4096])
+            return
+
+        await msg.edit_text("Mengedit gambar... (30-60 detik)")
+
+        vision_prompt = (
+            f'Kamu AI image editor. Analisa foto ini dan buat prompt bahasa Inggris '
+            f'yang detail untuk menghasilkan gambar baru berdasarkan instruksi: "{caption}"\n\n'
+            f"Gabungkan elemen visual dari foto asli dengan perubahan yang diminta.\n"
+            f"Return HANYA prompt bahasa Inggris (max 80 kata) untuk AI image generator."
+        )
+        vision_resp = gemini.generate_content([vision_prompt, image_part])
+        new_prompt  = vision_resp.text.strip()
+
+        encoded = urllib.parse.quote(new_prompt)
+        seed    = abs(hash(new_prompt + caption)) % 99999
+        url     = (f"https://image.pollinations.ai/prompt/{encoded}"
+                   f"?width=1024&height=1024&nologo=true&enhance=true&seed={seed}")
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            img_resp = await client.get(url)
+            img_resp.raise_for_status()
+
+        await msg.delete()
+        await update.message.reply_photo(
+            photo=img_resp.content,
+            caption=f"Edit: {caption}",
+        )
+    except Exception as e:
+        logger.error(f"Photo error: {e}")
+        await msg.edit_text("Gagal memproses foto. Coba lagi.")
+
+
+async def story_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Contoh:\n"
+            "/story promosi skincare untuk remaja\n"
+            "/story petualangan di hutan hujan\n"
+            "/story iklan kafe aesthetic"
+        )
+        return
+
+    tema = " ".join(context.args)
+    msg  = await update.message.reply_text(f"Membuat story: {tema}...\n(bisa 1-2 menit)")
+
+    try:
+        story_prompt = f"""Buat script/story menarik dengan tema: "{tema}"
+
+Return JSON ini SAJA:
+{{
+  "judul": "judul menarik",
+  "scenes": [
+    {{
+      "narasi": "narasi scene 1 bahasa Indonesia (2-3 kalimat)",
+      "image_prompt": "detailed English prompt for AI image generator, vivid, max 60 words"
+    }},
+    {{
+      "narasi": "narasi scene 2 bahasa Indonesia (2-3 kalimat)",
+      "image_prompt": "detailed English prompt for AI image generator, vivid, max 60 words"
+    }}
+  ],
+  "penutup": "kalimat penutup atau CTA bahasa Indonesia"
+}}"""
+
+        resp = gemini.generate_content(story_prompt)
+        raw  = re.sub(r"```json\n?|\n?```", "", resp.text.strip()).strip()
+        data = json.loads(raw)
+
+        for i, scene in enumerate(data["scenes"], 1):
+            await msg.edit_text(f"Generating gambar scene {i} dari {len(data['scenes'])}...")
+
+            encoded = urllib.parse.quote(scene["image_prompt"])
+            seed    = abs(hash(scene["image_prompt"])) % 99999
+            url     = (f"https://image.pollinations.ai/prompt/{encoded}"
+                       f"?width=1024&height=576&nologo=true&enhance=true&seed={seed}")
+
+            async with httpx.AsyncClient(timeout=120) as client:
+                img_resp = await client.get(url)
+                img_resp.raise_for_status()
+
+            cap = f"*{data['judul']}*\n\n*Scene {i}*\n{scene['narasi']}"
+            if i == len(data["scenes"]):
+                cap += f"\n\n_{data['penutup']}_"
+
+            await update.message.reply_photo(
+                photo=img_resp.content,
+                caption=cap,
+                parse_mode="Markdown",
+            )
+
+        await msg.delete()
+
+    except Exception as e:
+        logger.error(f"Story error: {e}")
+        await msg.edit_text("Gagal membuat story. Coba lagi.")
+
+
+async def ugc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Contoh:\n"
+            "/ugc skincare vitamin C serum\n"
+            "/ugc kopi susu kekinian\n"
+            "/ugc sepatu sneakers putih"
+        )
+        return
+
+    produk = " ".join(context.args)
+    msg    = await update.message.reply_text(f"Generating UGC image: {produk}...")
+
+    try:
+        ugc_req = f"""Buat prompt foto UGC (User Generated Content) style untuk: "{produk}"
+
+UGC style: casual authentic lifestyle photography, seperti influencer/pengguna nyata, natural lighting, candid feel, real environment.
+
+Return JSON ini SAJA:
+{{
+  "image_prompt": "detailed UGC-style image prompt in English, max 80 words, mention lighting/setting/mood/aesthetic",
+  "caption": "caption media sosial bahasa Indonesia yang engaging (1-2 kalimat + 3 hashtag relevan)"
+}}"""
+
+        resp = gemini.generate_content(ugc_req)
+        raw  = re.sub(r"```json\n?|\n?```", "", resp.text.strip()).strip()
+        data = json.loads(raw)
+
+        image_prompt = data["image_prompt"]
+        caption      = data["caption"]
+
+        encoded = urllib.parse.quote(image_prompt)
+        seed    = abs(hash(image_prompt + produk)) % 99999
+        url     = (f"https://image.pollinations.ai/prompt/{encoded}"
+                   f"?width=1024&height=1024&nologo=true&enhance=true&seed={seed}")
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            img_resp = await client.get(url)
+            img_resp.raise_for_status()
+
+        await msg.delete()
+        await update.message.reply_photo(
+            photo=img_resp.content,
+            caption=f"{caption}",
+        )
+
+    except Exception as e:
+        logger.error(f"UGC error: {e}")
+        await msg.edit_text("Gagal generate UGC image. Coba lagi.")
+
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("help",   help_command))
-    app.add_handler(CommandHandler("clear",  clear))
-    app.add_handler(CommandHandler("setup",  setup_command))
-    app.add_handler(CommandHandler("saldo",  saldo_command))
-    app.add_handler(CommandHandler("image",  image_command))
+    app.add_handler(CommandHandler("start",      start))
+    app.add_handler(CommandHandler("help",       help_command))
+    app.add_handler(CommandHandler("clear",      clear))
+    app.add_handler(CommandHandler("setup",      setup_command))
+    app.add_handler(CommandHandler("saldo",      saldo_command))
+    app.add_handler(CommandHandler("image",      image_command))
+    app.add_handler(CommandHandler("editimage",  editimage_command))
+    app.add_handler(CommandHandler("story",      story_command))
+    app.add_handler(CommandHandler("ugc",        ugc_command))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
     logger.info("Bot berjalan...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
