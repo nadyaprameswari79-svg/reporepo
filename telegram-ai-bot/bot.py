@@ -2,6 +2,10 @@ import os
 import re
 import json
 import base64
+import hmac
+import hashlib
+import time
+import asyncio
 import logging
 import urllib.parse
 from datetime import datetime
@@ -23,6 +27,11 @@ GEMINI_API_KEY     = os.environ["GEMINI_API_KEY"]
 GOOGLE_CREDENTIALS = os.environ["GOOGLE_CREDENTIALS"]
 SPREADSHEET_ID     = os.environ["SPREADSHEET_ID"]
 ALLOWED_USER_ID    = int(os.environ.get("ALLOWED_USER_ID", "0"))
+HF_TOKEN       = os.environ.get("HF_TOKEN", "")
+KLING_API_KEY  = os.environ.get("KLING_API_KEY", "")
+
+KLING_API  = "https://api.klingai.com"
+HF_PIX2PIX = "https://api-inference.huggingface.co/models/timbrooks/instruct-pix2pix"
 
 genai.configure(api_key=GEMINI_API_KEY)
 gemini = genai.GenerativeModel("gemini-2.5-flash")
@@ -33,6 +42,72 @@ SCOPES = [
 ]
 
 sessions: dict[int, genai.ChatSession] = {}
+
+
+async def hf_edit_image(image_bytes: bytes, instruction: str) -> bytes | None:
+    if not HF_TOKEN:
+        return None
+    headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "inputs": base64.b64encode(image_bytes).decode(),
+        "parameters": {
+            "prompt": instruction,
+            "negative_prompt": "blurry, distorted, low quality, ugly",
+            "num_inference_steps": 20,
+            "guidance_scale": 7.5,
+            "image_guidance_scale": 1.5,
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(HF_PIX2PIX, headers=headers, json=payload)
+            if resp.status_code == 200 and "image" in resp.headers.get("content-type", ""):
+                return resp.content
+            logger.warning(f"HF img2img: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        logger.error(f"HF img2img error: {e}")
+    return None
+
+
+async def kling_make_video(prompt: str, image_bytes: bytes | None = None) -> str | None:
+    if not KLING_API_KEY:
+        return None
+    headers = {"Authorization": f"Bearer {KLING_API_KEY}", "Content-Type": "application/json"}
+
+    if image_bytes:
+        endpoint = "/v1/videos/image2video"
+        payload  = {
+            "model_name": "kling-v1",
+            "image": base64.b64encode(image_bytes).decode(),
+            "prompt": prompt,
+            "duration": "5",
+        }
+    else:
+        endpoint = "/v1/videos/text2video"
+        payload  = {
+            "model_name": "kling-v1",
+            "prompt": prompt,
+            "duration": "5",
+            "aspect_ratio": "9:16",
+        }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(f"{KLING_API}{endpoint}", headers=headers, json=payload)
+        resp.raise_for_status()
+        task_id = resp.json()["data"]["task_id"]
+
+    check_url = f"{KLING_API}{endpoint}/{task_id}"
+    for _ in range(30):
+        await asyncio.sleep(10)
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(check_url, headers=headers)
+            d = r.json()["data"]
+            if d["task_status"] == "succeed":
+                return d["task_result"]["videos"][0]["url"]
+            if d["task_status"] == "failed":
+                logger.error(f"Kling failed: {r.text[:300]}")
+                return None
+    return None
 
 
 def is_allowed(user_id: int) -> bool:
@@ -224,8 +299,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "PERINTAH AI:\n"
         "/image <prompt>  — Generate gambar\n"
         "/editimage       — Edit foto (kirim foto + caption)\n"
+        "/video <prompt>  — Generate video (Kling AI)\n"
         "/story <tema>    — Buat script + gambar per scene\n"
         "/ugc <produk>    — Generate foto UGC style\n\n"
+        "Image-to-video: kirim foto + caption 'video <deskripsi>'\n\n"
         "KEUANGAN:\n"
         "/saldo  — Cek saldo\n"
         "/setup  — Setup Google Sheets\n"
@@ -241,6 +318,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/editimage                   — Lihat cara edit foto\n"
         "  → Kirim foto + caption instruksi edit\n"
         "  → Contoh: foto selfie + caption 'ganti background pantai'\n"
+        "/video kucing berlari di taman — Text to video (Kling)\n"
+        "  → Kirim foto + caption 'video <deskripsi>' — Image to video\n"
         "/story promosi kopi kekinian — Script + gambar 2 scene\n"
         "/ugc skincare vitamin C      — Foto UGC style otomatis\n\n"
         "KEUANGAN (chat biasa):\n"
@@ -350,6 +429,43 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Terjadi kesalahan. Coba lagi.")
 
 
+async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    if not KLING_API_KEY:
+        await update.message.reply_text(
+            "Fitur video belum aktif.\n"
+            "Tambah KLING_API_KEY di Railway Variables.\n\n"
+            "Daftar gratis di: klingai.com → API"
+        )
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Contoh:\n"
+            "/video kucing berlari di taman bunga\n"
+            "/video ombak laut di pantai saat sunset\n\n"
+            "Image-to-video: kirim foto + caption: video <deskripsi>"
+        )
+        return
+
+    prompt = " ".join(context.args)
+    msg    = await update.message.reply_text(
+        f"Generating video...\n{prompt}\n\n(Proses 2-5 menit)"
+    )
+    try:
+        video_url = await kling_make_video(prompt)
+        if not video_url:
+            await msg.edit_text("Gagal generate video. Coba lagi.")
+            return
+        async with httpx.AsyncClient(timeout=120) as client:
+            vresp = await client.get(video_url)
+        await msg.delete()
+        await update.message.reply_video(video=vresp.content, caption=prompt)
+    except Exception as e:
+        logger.error(f"Video error: {e}")
+        await msg.edit_text("Gagal generate video. Coba lagi.")
+
+
 async def editimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -376,8 +492,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         file        = await photo.get_file()
         image_bytes = bytes(await file.download_as_bytearray())
-        image_part  = {"mime_type": "image/jpeg", "data": image_bytes}
 
+        # Image to Video
+        if caption.lower().startswith("video"):
+            if not KLING_API_KEY:
+                await msg.edit_text(
+                    "Fitur video belum aktif.\n"
+                    "Tambah KLING_API_KEY di Railway Variables."
+                )
+                return
+            vid_prompt = caption[5:].strip() or "animate this image naturally and smoothly"
+            await msg.edit_text("Generating video dari foto...\n(2-5 menit, tunggu ya!)")
+            video_url = await kling_make_video(vid_prompt, image_bytes)
+            if not video_url:
+                await msg.edit_text("Gagal generate video. Coba lagi.")
+                return
+            async with httpx.AsyncClient(timeout=120) as client:
+                vresp = await client.get(video_url)
+            await msg.delete()
+            await update.message.reply_video(video=vresp.content, caption=f"Video: {vid_prompt}")
+            return
+
+        # Describe only
+        image_part = {"mime_type": "image/jpeg", "data": image_bytes}
         if not caption:
             response = gemini.generate_content([
                 "Deskripsikan gambar ini dengan detail dalam bahasa Indonesia.",
@@ -386,13 +523,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(response.text[:4096])
             return
 
+        # Edit Image — coba HF dulu, fallback Pollinations
         await msg.edit_text("Mengedit gambar... (30-60 detik)")
+        result_bytes = await hf_edit_image(image_bytes, caption)
+        if result_bytes:
+            await msg.delete()
+            await update.message.reply_photo(photo=result_bytes, caption=f"Edit: {caption}")
+            return
 
         vision_prompt = (
-            f'Kamu AI image editor. Analisa foto ini dan buat prompt bahasa Inggris '
-            f'yang detail untuk menghasilkan gambar baru berdasarkan instruksi: "{caption}"\n\n'
-            f"Gabungkan elemen visual dari foto asli dengan perubahan yang diminta.\n"
-            f"Return HANYA prompt bahasa Inggris (max 80 kata) untuk AI image generator."
+            f'Analisa foto ini dengan SANGAT detail.\n\n'
+            f'Buat prompt bahasa Inggris untuk menghasilkan gambar yang SEMIRIP MUNGKIN dengan foto asli, '
+            f'hanya dengan perubahan: "{caption}"\n\n'
+            f'1. Deskripsikan subjek utama secara SANGAT spesifik: warna, bentuk, tekstur, pose, ekspresi, pakaian, branding/teks pada produk\n'
+            f'2. Terapkan HANYA perubahan yang diminta\n'
+            f'3. Pertahankan semua elemen lain secara eksplisit\n'
+            f'4. Tambahkan: photorealistic, high quality, professional photography\n\n'
+            f'Return HANYA prompt bahasa Inggris (max 120 kata).'
         )
         vision_resp = gemini.generate_content([vision_prompt, image_part])
         new_prompt  = vision_resp.text.strip()
@@ -407,10 +554,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             img_resp.raise_for_status()
 
         await msg.delete()
-        await update.message.reply_photo(
-            photo=img_resp.content,
-            caption=f"Edit: {caption}",
-        )
+        await update.message.reply_photo(photo=img_resp.content, caption=f"Edit: {caption}")
+
     except Exception as e:
         logger.error(f"Photo error: {e}")
         await msg.edit_text("Gagal memproses foto. Coba lagi.")
@@ -526,10 +671,7 @@ Return JSON ini SAJA:
             img_resp.raise_for_status()
 
         await msg.delete()
-        await update.message.reply_photo(
-            photo=img_resp.content,
-            caption=f"{caption}",
-        )
+        await update.message.reply_photo(photo=img_resp.content, caption=caption)
 
     except Exception as e:
         logger.error(f"UGC error: {e}")
@@ -544,6 +686,7 @@ def main():
     app.add_handler(CommandHandler("setup",      setup_command))
     app.add_handler(CommandHandler("saldo",      saldo_command))
     app.add_handler(CommandHandler("image",      image_command))
+    app.add_handler(CommandHandler("video",      video_command))
     app.add_handler(CommandHandler("editimage",  editimage_command))
     app.add_handler(CommandHandler("story",      story_command))
     app.add_handler(CommandHandler("ugc",        ugc_command))
