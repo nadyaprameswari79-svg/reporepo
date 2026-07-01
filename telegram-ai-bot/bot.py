@@ -27,11 +27,11 @@ GEMINI_API_KEY     = os.environ["GEMINI_API_KEY"]
 GOOGLE_CREDENTIALS = os.environ["GOOGLE_CREDENTIALS"]
 SPREADSHEET_ID     = os.environ["SPREADSHEET_ID"]
 ALLOWED_USER_ID    = int(os.environ.get("ALLOWED_USER_ID", "0"))
-HF_TOKEN       = os.environ.get("HF_TOKEN", "")
-KLING_API_KEY  = os.environ.get("KLING_API_KEY", "")
+HF_TOKEN            = os.environ.get("HF_TOKEN", "")
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
 
-KLING_API  = "https://api.klingai.com"
-HF_PIX2PIX = "https://api-inference.huggingface.co/models/timbrooks/instruct-pix2pix"
+REPLICATE_API = "https://api.replicate.com/v1"
+HF_PIX2PIX    = "https://api-inference.huggingface.co/models/timbrooks/instruct-pix2pix"
 
 genai.configure(api_key=GEMINI_API_KEY)
 gemini = genai.GenerativeModel("gemini-2.5-flash")
@@ -69,45 +69,52 @@ async def hf_edit_image(image_bytes: bytes, instruction: str) -> bytes | None:
     return None
 
 
-async def kling_make_video(prompt: str, image_bytes: bytes | None = None) -> str | None:
-    if not KLING_API_KEY:
-        return None
-    headers = {"Authorization": f"Bearer {KLING_API_KEY}", "Content-Type": "application/json"}
+async def make_video(prompt: str, image_bytes: bytes | None = None) -> tuple[str | None, str]:
+    if not REPLICATE_API_TOKEN:
+        return None, "REPLICATE_API_TOKEN belum diset di Railway Variables"
+
+    headers = {
+        "Authorization": f"Token {REPLICATE_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
     if image_bytes:
-        endpoint = "/v1/videos/image2video"
-        payload  = {
-            "model_name": "kling-v1",
-            "image": base64.b64encode(image_bytes).decode(),
-            "prompt": prompt,
-            "duration": "5",
-        }
+        image_data = f"data:image/jpeg;base64,{base64.b64encode(image_bytes).decode()}"
+        inp = {"prompt": prompt, "first_frame_image": image_data}
     else:
-        endpoint = "/v1/videos/text2video"
-        payload  = {
-            "model_name": "kling-v1",
-            "prompt": prompt,
-            "duration": "5",
-            "aspect_ratio": "9:16",
-        }
+        inp = {"prompt": prompt}
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(f"{KLING_API}{endpoint}", headers=headers, json=payload)
-        resp.raise_for_status()
-        task_id = resp.json()["data"]["task_id"]
-
-    check_url = f"{KLING_API}{endpoint}/{task_id}"
-    for _ in range(30):
-        await asyncio.sleep(10)
+    try:
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(check_url, headers=headers)
-            d = r.json()["data"]
-            if d["task_status"] == "succeed":
-                return d["task_result"]["videos"][0]["url"]
-            if d["task_status"] == "failed":
-                logger.error(f"Kling failed: {r.text[:300]}")
-                return None
-    return None
+            resp = await client.post(
+                f"{REPLICATE_API}/models/minimax/video-01/predictions",
+                headers=headers,
+                json={"input": inp},
+            )
+            logger.info(f"Replicate create: {resp.status_code} {resp.text[:300]}")
+            if resp.status_code not in (200, 201):
+                return None, f"API error {resp.status_code}: {resp.text[:200]}"
+            data    = resp.json()
+            get_url = data["urls"]["get"]
+    except Exception as e:
+        return None, f"Request failed: {e}"
+
+    for _ in range(60):
+        await asyncio.sleep(10)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r      = await client.get(get_url, headers=headers)
+                d      = r.json()
+                status = d.get("status")
+                logger.info(f"Replicate status: {status}")
+                if status == "succeeded":
+                    out = d["output"]
+                    return (out[0] if isinstance(out, list) else out), ""
+                if status == "failed":
+                    return None, f"Failed: {d.get('error', 'unknown')}"
+        except Exception as e:
+            return None, f"Poll error: {e}"
+    return None, "Timeout — video tidak selesai dalam 10 menit"
 
 
 def is_allowed(user_id: int) -> bool:
@@ -299,7 +306,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "PERINTAH AI:\n"
         "/image <prompt>  — Generate gambar\n"
         "/editimage       — Edit foto (kirim foto + caption)\n"
-        "/video <prompt>  — Generate video (Kling AI)\n"
+        "/video <prompt>  — Generate video (Minimax via Replicate)\n"
         "/story <tema>    — Buat script + gambar per scene\n"
         "/ugc <produk>    — Generate foto UGC style\n\n"
         "Image-to-video: kirim foto + caption 'video <deskripsi>'\n\n"
@@ -318,7 +325,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/editimage                   — Lihat cara edit foto\n"
         "  → Kirim foto + caption instruksi edit\n"
         "  → Contoh: foto selfie + caption 'ganti background pantai'\n"
-        "/video kucing berlari di taman — Text to video (Kling)\n"
+        "/video kucing berlari di taman — Text to video (Minimax)\n"
         "  → Kirim foto + caption 'video <deskripsi>' — Image to video\n"
         "/story promosi kopi kekinian — Script + gambar 2 scene\n"
         "/ugc skincare vitamin C      — Foto UGC style otomatis\n\n"
@@ -432,11 +439,11 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-    if not KLING_API_KEY:
+    if not REPLICATE_API_TOKEN:
         await update.message.reply_text(
             "Fitur video belum aktif.\n"
-            "Tambah KLING_API_KEY di Railway Variables.\n\n"
-            "Daftar gratis di: klingai.com → API"
+            "Tambah REPLICATE_API_TOKEN di Railway Variables.\n\n"
+            "Daftar gratis di: replicate.com → Account → API Tokens"
         )
         return
     if not context.args:
@@ -453,9 +460,9 @@ async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Generating video...\n{prompt}\n\n(Proses 2-5 menit)"
     )
     try:
-        video_url = await kling_make_video(prompt)
+        video_url, err = await make_video(prompt)
         if not video_url:
-            await msg.edit_text("Gagal generate video. Coba lagi.")
+            await msg.edit_text(f"Gagal generate video.\n\nError: {err}")
             return
         async with httpx.AsyncClient(timeout=120) as client:
             vresp = await client.get(video_url)
@@ -463,7 +470,7 @@ async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_video(video=vresp.content, caption=prompt)
     except Exception as e:
         logger.error(f"Video error: {e}")
-        await msg.edit_text("Gagal generate video. Coba lagi.")
+        await msg.edit_text(f"Gagal generate video.\nError: {e}")
 
 
 async def editimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -495,17 +502,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Image to Video
         if caption.lower().startswith("video"):
-            if not KLING_API_KEY:
+            if not REPLICATE_API_TOKEN:
                 await msg.edit_text(
                     "Fitur video belum aktif.\n"
-                    "Tambah KLING_API_KEY di Railway Variables."
+                    "Tambah REPLICATE_API_TOKEN di Railway Variables."
                 )
                 return
             vid_prompt = caption[5:].strip() or "animate this image naturally and smoothly"
             await msg.edit_text("Generating video dari foto...\n(2-5 menit, tunggu ya!)")
-            video_url = await kling_make_video(vid_prompt, image_bytes)
+            video_url, err = await make_video(vid_prompt, image_bytes)
             if not video_url:
-                await msg.edit_text("Gagal generate video. Coba lagi.")
+                await msg.edit_text(f"Gagal generate video.\nError: {err}")
                 return
             async with httpx.AsyncClient(timeout=120) as client:
                 vresp = await client.get(video_url)
@@ -658,11 +665,8 @@ Return JSON ini SAJA:
         raw  = re.sub(r"```json\n?|\n?```", "", resp.text.strip()).strip()
         data = json.loads(raw)
 
-        image_prompt = data["image_prompt"]
-        caption      = data["caption"]
-
-        encoded = urllib.parse.quote(image_prompt)
-        seed    = abs(hash(image_prompt + produk)) % 99999
+        encoded = urllib.parse.quote(data["image_prompt"])
+        seed    = abs(hash(data["image_prompt"] + produk)) % 99999
         url     = (f"https://image.pollinations.ai/prompt/{encoded}"
                    f"?width=1024&height=1024&nologo=true&enhance=true&seed={seed}")
 
@@ -671,7 +675,7 @@ Return JSON ini SAJA:
             img_resp.raise_for_status()
 
         await msg.delete()
-        await update.message.reply_photo(photo=img_resp.content, caption=caption)
+        await update.message.reply_photo(photo=img_resp.content, caption=data["caption"])
 
     except Exception as e:
         logger.error(f"UGC error: {e}")
